@@ -977,6 +977,9 @@ impl<R: Read> EntryFields<R> {
 
 impl<R: Read> Read for EntryFields<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        if into.is_empty() {
+            return Ok(0);
+        }
         loop {
             match self
                 .data
