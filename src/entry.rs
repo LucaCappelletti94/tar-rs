@@ -25,8 +25,6 @@ pub struct Entry<'a, R: 'a + Read> {
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
 
-// private implementation detail of `Entry`, but concrete (no type parameters)
-// and also all-public to be constructed from other modules.
 pub struct EntryFields<R> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,

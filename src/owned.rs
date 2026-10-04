@@ -172,9 +172,6 @@ impl<R: Read> Read for OwnedEntry<R> {
         if self.failed {
             return Err(other("cannot read a failed member"));
         }
-        if into.is_empty() {
-            return Ok(0);
-        }
         let result = self.fields.read(into);
         if let Err(error) = &result {
             self.failed = error.kind() != io::ErrorKind::Interrupted;

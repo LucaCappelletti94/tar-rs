@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use flate2::read::MultiGzDecoder;
@@ -78,23 +78,23 @@ fn recovered_decoder_observes_later_gzip_footer_failure() {
     assert!(tail.starts_with(&[0; 512]));
 }
 
-struct CountingReader<R> {
+struct CountingReader<'a, R> {
     reader: R,
-    bytes: Arc<AtomicUsize>,
-    drops: Arc<AtomicUsize>,
+    bytes: &'a Cell<usize>,
+    drops: &'a Cell<usize>,
 }
 
-impl<R: Read> Read for CountingReader<R> {
+impl<R: Read> Read for CountingReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let n = self.reader.read(buffer)?;
-        self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.bytes.set(self.bytes.get() + n);
         Ok(n)
     }
 }
 
-impl<R> Drop for CountingReader<R> {
+impl<R> Drop for CountingReader<'_, R> {
     fn drop(&mut self) {
-        self.drops.fetch_add(1, Ordering::Relaxed);
+        self.drops.set(self.drops.get() + 1);
     }
 }
 
@@ -103,12 +103,12 @@ fn dropping_early_or_after_completion_releases_reader_without_extra_reads() {
     let body = "record\n".repeat(1024);
     let tar = archive(&[("data.lines", body.as_bytes())]);
     for early in [true, false] {
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let drops = Arc::new(AtomicUsize::new(0));
+        let bytes = Cell::new(0);
+        let drops = Cell::new(0);
         let reader = CountingReader {
             reader: &tar[..],
-            bytes: bytes.clone(),
-            drops: drops.clone(),
+            bytes: &bytes,
+            drops: &drops,
         };
         let mut stream = Records::new(reader);
         assert_eq!(stream.next().unwrap().unwrap(), "record\n");
@@ -116,13 +116,13 @@ fn dropping_early_or_after_completion_releases_reader_without_extra_reads() {
             let rest = stream.by_ref().collect::<io::Result<Vec<_>>>().unwrap();
             assert_eq!(rest.concat(), "record\n".repeat(1023));
         }
-        let before = bytes.load(Ordering::Relaxed);
+        let before = bytes.get();
         if early {
             assert!(before < 512 + body.len());
         }
         drop(stream);
-        assert_eq!(bytes.load(Ordering::Relaxed), before);
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes.get(), before);
+        assert_eq!(drops.get(), 1);
     }
 }
 
@@ -142,4 +142,34 @@ fn early_drop_closes_owned_file_descriptor() {
     assert_eq!(stream.next().unwrap().unwrap(), "record\n");
     drop(stream);
     assert_ne!(std::fs::read_link(descriptor).ok(), Some(target));
+}
+
+#[test]
+fn record_errors_release_state_and_are_emitted_once() {
+    let mut corrupt = archive(&[("data.lines", b"record\n")]);
+    corrupt[0] ^= 1;
+    let ignored = archive(&[("ignored.bin", b"unread body")]);
+    let selected = archive(&[("data.lines", b"record\n")]);
+    for (input, first) in [
+        (&corrupt[..], None),
+        (&archive(&[("data.lines", &[0xff])])[..], None),
+        (&ignored[..513], None),
+        (&selected[..519], Some("record\n")),
+    ] {
+        let bytes = Cell::new(0);
+        let drops = Cell::new(0);
+        let mut stream = Records::new(CountingReader {
+            reader: input,
+            bytes: &bytes,
+            drops: &drops,
+        });
+        if let Some(expected) = first {
+            assert_eq!(stream.next().unwrap().unwrap(), expected);
+        }
+        assert!(stream.next().unwrap().is_err());
+        assert_eq!(drops.get(), 1);
+        let before = bytes.get();
+        assert!(stream.next().is_none());
+        assert_eq!(bytes.get(), before);
+    }
 }

@@ -44,26 +44,7 @@ fn main() {
 
 `OwnedArchive` and `OwnedEntry` are `Send` when their reader is `Send`. Advancing consumes the archive, and finishing a member skips unread bytes and padding before returning the archive. Dropping either type releases the reader without draining it.
 
-```rust
-use std::io::{self, Read};
-use tar::{OwnedArchive, OwnedStep};
-
-let mut archive = OwnedArchive::new(io::empty());
-let mut buffer = [0; 64];
-loop {
-    match archive.advance()? {
-        OwnedStep::Entry(mut entry) => {
-            while entry.read(&mut buffer)? != 0 {}
-            archive = entry.finish()?;
-        }
-        OwnedStep::End(archive) => {
-            let _reader = archive.into_inner();
-            break;
-        }
-    }
-}
-# Ok::<(), io::Error>(())
-```
+The [record iterator example](examples/owned_lines.rs) retains a buffered member across calls, selects members in archive order, and recovers the reader for decoder validation.
 
 `into_inner` returns the reader at its current position without validating unread data. At clean TAR completion, callers can recover a compression decoder and drain it to validate the remaining compressed stream. Parsing and member completion errors release the reader, and a body read error other than `Interrupted` prevents member completion from resuming traversal.
 

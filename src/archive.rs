@@ -182,13 +182,7 @@ impl<R: Read> Archive<R> {
         next: u64,
         raw: bool,
     ) -> io::Result<(Option<EntryFields<()>>, u64)> {
-        let mut entries = EntriesFields {
-            archive: self,
-            seekable_archive: None,
-            next,
-            done: false,
-            raw,
-        };
+        let mut entries = EntriesFields::new(self, next, raw);
         let entry = entries
             .next_entry()?
             .map(|entry| EntryFields::from(entry).map_reader(()));
@@ -196,13 +190,7 @@ impl<R: Read> Archive<R> {
     }
 
     pub(crate) fn finish_owned(&self, next: u64) -> io::Result<()> {
-        let mut entries = EntriesFields {
-            archive: self,
-            seekable_archive: None,
-            next,
-            done: false,
-            raw: false,
-        };
+        let mut entries = EntriesFields::new(self, next, false);
         EntriesFields::skip(&mut entries, next - self.inner.pos.get())
     }
 }
@@ -237,11 +225,8 @@ impl Archive<dyn Read + '_> {
             ));
         }
         Ok(EntriesFields {
-            archive: self,
             seekable_archive,
-            done: false,
-            next: 0,
-            raw: false,
+            ..EntriesFields::new(self, 0, false)
         })
     }
 
@@ -311,6 +296,16 @@ impl<'a, R: Read> Iterator for Entries<'a, R> {
 }
 
 impl<'a> EntriesFields<'a> {
+    fn new(archive: &'a Archive<dyn Read + 'a>, next: u64, raw: bool) -> Self {
+        Self {
+            archive,
+            seekable_archive: None,
+            next,
+            done: false,
+            raw,
+        }
+    }
+
     fn next_entry_raw(
         &mut self,
         pax_extensions: Option<&[u8]>,
@@ -638,8 +633,7 @@ impl<R: ?Sized + Read> Read for &ArchiveInner<R> {
 impl<R: Read> Read for ArchiveInner<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
         let n = self.obj.get_mut().read(into)?;
-        let amount = u64::try_from(n).map_err(|_| other("read size out of bounds"))?;
-        *self.pos.get_mut() += amount;
+        *self.pos.get_mut() += n as u64;
         Ok(n)
     }
 }

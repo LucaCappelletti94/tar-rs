@@ -2,22 +2,10 @@
 
 use std::cell::Cell;
 use std::io::{self, Cursor, ErrorKind, Read};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use tar::{Builder, EntryType, Header, OwnedArchive, OwnedEntry, OwnedStep};
-
-#[derive(Debug, PartialEq, Eq)]
-struct Member {
-    path: Vec<u8>,
-    link: Option<Vec<u8>>,
-    header: Vec<u8>,
-    kind: EntryType,
-    size: u64,
-    positions: (u64, u64),
-    body: Vec<u8>,
-}
 
 fn entry<R: Read>(archive: OwnedArchive<R>) -> OwnedEntry<R> {
     match archive.advance().unwrap() {
@@ -46,53 +34,14 @@ fn two_members() -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
-fn owned(mut archive: OwnedArchive<&[u8]>, read_body: bool) -> Vec<Member> {
-    let mut members = Vec::new();
+fn read_into(reader: &mut impl Read, buffer: &mut [u8], body: &mut Vec<u8>) {
     loop {
-        match archive.advance().unwrap() {
-            OwnedStep::Entry(mut entry) => {
-                let mut body = Vec::new();
-                if read_body {
-                    entry.read_to_end(&mut body).unwrap();
-                }
-                members.push(Member {
-                    path: entry.path_bytes().into_owned(),
-                    link: entry.link_name_bytes().map(|link| link.into_owned()),
-                    header: entry.header().as_bytes().to_vec(),
-                    kind: entry.header().entry_type(),
-                    size: entry.size(),
-                    positions: (entry.raw_header_position(), entry.raw_file_position()),
-                    body,
-                });
-                archive = entry.finish().unwrap();
-            }
-            OwnedStep::End(_) => return members,
+        let n = reader.read(buffer).unwrap();
+        if n == 0 {
+            break;
         }
+        body.extend_from_slice(&buffer[..n]);
     }
-}
-
-fn borrowed(bytes: &[u8], read_body: bool) -> Vec<Member> {
-    let mut archive = tar::Archive::new(bytes);
-    archive
-        .entries()
-        .unwrap()
-        .map(|entry| {
-            let mut entry = entry.unwrap();
-            let mut body = Vec::new();
-            if read_body {
-                entry.read_to_end(&mut body).unwrap();
-            }
-            Member {
-                path: entry.path_bytes().into_owned(),
-                link: entry.link_name_bytes().map(|link| link.into_owned()),
-                header: entry.header().as_bytes().to_vec(),
-                kind: entry.header().entry_type(),
-                size: entry.size(),
-                positions: (entry.raw_header_position(), entry.raw_file_position()),
-                body,
-            }
-        })
-        .collect()
 }
 
 #[test]
@@ -108,26 +57,14 @@ fn nonseekable_members_are_bounded_and_finish_skips_remainder_and_padding() {
         assert_eq!(first.read(&mut []).unwrap(), 0);
         if !partial {
             let mut body = buffer.to_vec();
-            loop {
-                let n = first.read(&mut buffer).unwrap();
-                if n == 0 {
-                    break;
-                }
-                body.extend_from_slice(&buffer[..n]);
-            }
+            read_into(&mut first, &mut buffer, &mut body);
             assert_eq!(body, b"0123456789");
             assert_eq!(first.read(&mut buffer).unwrap(), 0);
         }
         let mut second = entry(first.finish().unwrap());
         assert_eq!(second.path_bytes().as_ref(), b"a");
         let mut body = Vec::new();
-        loop {
-            let n = second.read(&mut buffer).unwrap();
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&buffer[..n]);
-        }
+        read_into(&mut second, &mut buffer, &mut body);
         assert_eq!(body, b"abcdefg");
         let mut tail = end(second.finish().unwrap()).into_inner();
         assert_eq!(tail.read_to_end(&mut Vec::new()).unwrap(), 512);
@@ -157,38 +94,39 @@ fn gnu_names_links_and_raw_iteration() {
         Some(target.as_str())
     );
     end(link.finish().unwrap());
-    let raw = owned(OwnedArchive::new(&bytes[..]).raw(true), true);
-    assert_eq!(
-        raw.iter().map(|m| m.kind).collect::<Vec<_>>(),
-        [
-            EntryType::GNULongName,
-            EntryType::Regular,
-            EntryType::GNULongLink,
-            EntryType::Symlink,
-        ]
-    );
-    assert_eq!(raw[0].body.strip_suffix(&[0]).unwrap(), name.as_bytes());
-    assert_eq!(raw[2].body.strip_suffix(&[0]).unwrap(), target.as_bytes());
+    let mut raw = OwnedArchive::new(&bytes[..]).raw(true);
+    for (kind, expected) in [
+        (EntryType::GNULongName, name.as_bytes()),
+        (EntryType::Regular, &b"body"[..]),
+        (EntryType::GNULongLink, target.as_bytes()),
+        (EntryType::Symlink, &b""[..]),
+    ] {
+        let mut member = entry(raw);
+        assert_eq!(member.header().entry_type(), kind);
+        body.clear();
+        member.read_to_end(&mut body).unwrap();
+        if kind.is_gnu_longname() || kind.is_gnu_longlink() {
+            assert_eq!(body.pop(), Some(0));
+        }
+        assert_eq!(body, expected);
+        raw = member.finish().unwrap();
+    }
+    end(raw);
 }
 
 #[test]
 fn pax_metadata_and_size_do_not_leak_into_the_next_member() {
     let mut builder = Builder::new(Vec::new());
-    let mut pax = Header::new_ustar();
-    pax.set_entry_type(EntryType::XHeader);
-    pax.set_path("pax").unwrap();
-    let metadata = b"9 size=8\n14 path=paxed\n";
-    pax.set_size(u64::try_from(metadata.len()).unwrap());
-    pax.set_cksum();
-    builder.append(&pax, &metadata[..]).unwrap();
-    append(&mut builder, "raw", b"01234567");
-    append(&mut builder, "next", b"tail");
-    let mut bytes = builder.into_inner().unwrap();
+    builder
+        .append_pax_extensions([("size", &b"8"[..]), ("path", &b"paxed"[..])])
+        .unwrap();
     let mut header = Header::new_gnu();
-    header.as_mut_bytes().copy_from_slice(&bytes[1024..1536]);
+    header.set_path("raw").unwrap();
     header.set_size(4);
     header.set_cksum();
-    bytes[1024..1536].copy_from_slice(header.as_bytes());
+    builder.append(&header, &b"01234567"[..]).unwrap();
+    append(&mut builder, "next", b"tail");
+    let bytes = builder.into_inner().unwrap();
     let mut first = entry(OwnedArchive::new(&bytes[..]));
     assert_eq!(first.header().size().unwrap(), 4);
     assert_eq!(first.size(), 8);
@@ -217,10 +155,6 @@ fn pax_metadata_and_size_do_not_leak_into_the_next_member() {
     second.read_to_end(&mut body).unwrap();
     assert_eq!(body, b"tail");
     end(second.finish().unwrap());
-    assert_eq!(
-        owned(OwnedArchive::new(&bytes[..]), true),
-        borrowed(&bytes, true)
-    );
 }
 
 #[test]
@@ -229,26 +163,19 @@ fn ignore_zeros_preserves_concatenated_archive_order() {
     bytes.extend(two_members());
     let mut archive = OwnedArchive::new(&bytes[..]);
     archive.set_ignore_zeros(true);
-    let members = owned(archive, true);
-    assert_eq!(
-        members
-            .iter()
-            .map(|m| m.path.as_slice())
-            .collect::<Vec<_>>(),
-        [b"z", b"a", b"z", b"a"]
-    );
-    assert_eq!(
-        members
-            .iter()
-            .map(|m| m.body.as_slice())
-            .collect::<Vec<_>>(),
-        [
-            b"0123456789".as_slice(),
-            b"abcdefg".as_slice(),
-            b"0123456789".as_slice(),
-            b"abcdefg".as_slice()
-        ]
-    );
+    for (name, expected) in [("z", "0123456789"), ("a", "abcdefg")]
+        .iter()
+        .cycle()
+        .take(4)
+    {
+        let mut member = entry(archive);
+        assert_eq!(member.path_bytes().as_ref(), name.as_bytes());
+        let mut body = String::new();
+        member.read_to_string(&mut body).unwrap();
+        assert_eq!(&body, expected);
+        archive = member.finish().unwrap();
+    }
+    end(archive);
 }
 
 #[test]
@@ -286,11 +213,39 @@ fn valid_fixtures_match_borrowed_metadata_and_body_bytes() {
             false,
         ),
     ] {
-        assert_eq!(
-            owned(OwnedArchive::new(bytes), read_body),
-            borrowed(bytes, read_body),
-            "{name}"
-        );
+        let mut borrowed = tar::Archive::new(bytes);
+        let mut archive = OwnedArchive::new(bytes);
+        for member in borrowed.entries().unwrap() {
+            let mut member = member.unwrap();
+            let mut owning = entry(archive);
+            assert_eq!(owning.path_bytes(), member.path_bytes(), "{name}");
+            assert_eq!(owning.link_name_bytes(), member.link_name_bytes(), "{name}");
+            assert_eq!(
+                owning.header().as_bytes(),
+                member.header().as_bytes(),
+                "{name}"
+            );
+            assert_eq!(owning.size(), member.size(), "{name}");
+            assert_eq!(
+                owning.raw_header_position(),
+                member.raw_header_position(),
+                "{name}"
+            );
+            assert_eq!(
+                owning.raw_file_position(),
+                member.raw_file_position(),
+                "{name}"
+            );
+            if read_body {
+                let mut expected = Vec::new();
+                let mut actual = Vec::new();
+                member.read_to_end(&mut expected).unwrap();
+                owning.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, expected, "{name}");
+            }
+            archive = owning.finish().unwrap();
+        }
+        end(archive);
     }
 }
 
@@ -357,16 +312,16 @@ fn abandonment_recovers_actual_position_and_end_is_idempotent() {
     assert_eq!(cursor.position(), 512);
 }
 
-struct Faults<R> {
+struct Faults<'a, R> {
     reader: R,
     remaining: usize,
     interrupted: bool,
-    calls: Arc<AtomicUsize>,
+    calls: &'a Cell<usize>,
 }
 
-impl<R: Read> Read for Faults<R> {
+impl<R: Read> Read for Faults<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.calls.set(self.calls.get() + 1);
         if self.remaining == 0 {
             if self.interrupted {
                 self.interrupted = false;
@@ -389,12 +344,12 @@ impl<R: Read> Read for Faults<R> {
 fn body_errors_are_terminal_and_interrupted_reads_retry() {
     let bytes = two_members();
     for interrupted in [false, true] {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let calls = Cell::new(0);
         let reader = Faults {
             reader: &bytes[..],
             remaining: 516,
             interrupted,
-            calls: calls.clone(),
+            calls: &calls,
         };
         let mut first = entry(OwnedArchive::new(reader));
         let mut body = Vec::new();
@@ -416,10 +371,10 @@ fn body_errors_are_terminal_and_interrupted_reads_retry() {
                 .downcast_ref::<io::Error>()
                 .unwrap();
             assert_eq!(source.kind(), ErrorKind::PermissionDenied);
-            let before = calls.load(Ordering::Relaxed);
+            let before = calls.get();
             assert!(first.read(&mut [0; 1]).is_err());
             assert!(first.finish().is_err());
-            assert_eq!(calls.load(Ordering::Relaxed), before);
+            assert_eq!(calls.get(), before);
         }
     }
 }
