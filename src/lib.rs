@@ -49,6 +49,7 @@ pub use crate::header::GnuExtSparseHeader;
 #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 pub use crate::header::DETERMINISTIC_TIMESTAMP;
 pub use crate::header::{GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader};
+pub use crate::owned::{OwnedArchive, OwnedEntry, OwnedStep};
 pub use crate::pax::{PaxExtension, PaxExtensions};
 
 mod archive;
@@ -57,6 +58,7 @@ mod entry;
 mod entry_type;
 mod error;
 mod header;
+mod owned;
 mod pax;
 
 fn other(msg: &str) -> Error {

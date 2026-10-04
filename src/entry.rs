@@ -21,13 +21,13 @@ use crate::{Archive, Header, PaxExtensions};
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
 pub struct Entry<'a, R: 'a + Read> {
-    fields: EntryFields<'a>,
+    fields: EntryFields<&'a ArchiveInner<dyn Read + 'a>>,
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
 
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
-pub struct EntryFields<'a> {
+pub struct EntryFields<R> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
     pub pax_extensions: Option<Vec<u8>>,
@@ -36,7 +36,8 @@ pub struct EntryFields<'a> {
     pub size: u64,
     pub header_pos: u64,
     pub file_pos: u64,
-    pub data: Vec<EntryIo<'a>>,
+    pub data: Vec<EntryIo>,
+    pub reader: R,
     pub unpack_xattrs: bool,
     pub preserve_permissions: bool,
     pub preserve_ownerships: bool,
@@ -44,9 +45,9 @@ pub struct EntryFields<'a> {
     pub overwrite: bool,
 }
 
-pub enum EntryIo<'a> {
+pub enum EntryIo {
     Pad(io::Take<io::Repeat>),
-    Data(io::Take<&'a ArchiveInner<dyn Read + 'a>>),
+    Data(u64),
 }
 
 /// When unpacking items the unpacked thing is returned to allow custom
@@ -282,8 +283,8 @@ impl<'a, R: Read> Read for Entry<'a, R> {
     }
 }
 
-impl<'a> EntryFields<'a> {
-    pub fn from<R: Read>(entry: Entry<R>) -> EntryFields {
+impl<'a> EntryFields<&'a ArchiveInner<dyn Read + 'a>> {
+    pub fn from<R: Read>(entry: Entry<'a, R>) -> Self {
         entry.fields
     }
 
@@ -293,7 +294,31 @@ impl<'a> EntryFields<'a> {
             _ignored: marker::PhantomData,
         }
     }
+}
 
+impl<R> EntryFields<R> {
+    pub fn map_reader<T>(self, reader: T) -> EntryFields<T> {
+        EntryFields {
+            long_pathname: self.long_pathname,
+            long_linkname: self.long_linkname,
+            pax_extensions: self.pax_extensions,
+            mask: self.mask,
+            header: self.header,
+            size: self.size,
+            header_pos: self.header_pos,
+            file_pos: self.file_pos,
+            data: self.data,
+            reader,
+            unpack_xattrs: self.unpack_xattrs,
+            preserve_permissions: self.preserve_permissions,
+            preserve_ownerships: self.preserve_ownerships,
+            preserve_mtime: self.preserve_mtime,
+            overwrite: self.overwrite,
+        }
+    }
+}
+
+impl<R: Read> EntryFields<R> {
     pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
         // Preallocate some data but don't let ourselves get too crazy now.
         let cap = cmp::min(self.size, 128 * 1024);
@@ -301,11 +326,11 @@ impl<'a> EntryFields<'a> {
         self.read_to_end(&mut v).map(|_| v)
     }
 
-    fn path(&self) -> io::Result<Cow<'_, Path>> {
+    pub(crate) fn path(&self) -> io::Result<Cow<'_, Path>> {
         bytes2path(self.path_bytes())
     }
 
-    fn path_bytes(&self) -> Cow<'_, [u8]> {
+    pub(crate) fn path_bytes(&self) -> Cow<'_, [u8]> {
         match self.long_pathname {
             Some(ref bytes) => {
                 if let Some(&0) = bytes.last() {
@@ -334,14 +359,14 @@ impl<'a> EntryFields<'a> {
         String::from_utf8_lossy(&self.path_bytes()).to_string()
     }
 
-    fn link_name(&self) -> io::Result<Option<Cow<'_, Path>>> {
+    pub(crate) fn link_name(&self) -> io::Result<Option<Cow<'_, Path>>> {
         match self.link_name_bytes() {
             Some(bytes) => bytes2path(bytes).map(Some),
             None => Ok(None),
         }
     }
 
-    fn link_name_bytes(&self) -> Option<Cow<'_, [u8]>> {
+    pub(crate) fn link_name_bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self.long_linkname {
             Some(ref bytes) => {
                 if let Some(&0) = bytes.last() {
@@ -365,7 +390,7 @@ impl<'a> EntryFields<'a> {
         }
     }
 
-    fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions<'_>>> {
+    pub(crate) fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions<'_>>> {
         if self.pax_extensions.is_none() {
             if !self.header.entry_type().is_pax_global_extensions()
                 && !self.header.entry_type().is_pax_local_extensions()
@@ -662,8 +687,8 @@ impl<'a> EntryFields<'a> {
             })?;
             for io in self.data.drain(..) {
                 match io {
-                    EntryIo::Data(mut d) => {
-                        let expected = d.limit();
+                    EntryIo::Data(expected) => {
+                        let mut d = (&mut self.reader).take(expected);
                         if io::copy(&mut d, &mut f)? != expected {
                             return Err(other("failed to write entire file"));
                         }
@@ -858,7 +883,7 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(all(unix, not(target_arch = "wasm32"), feature = "xattr"))]
-        fn set_xattrs(me: &mut EntryFields, dst: &Path) -> io::Result<()> {
+        fn set_xattrs<R: Read>(me: &mut EntryFields<R>, dst: &Path) -> io::Result<()> {
             use std::ffi::OsStr;
             use std::os::unix::prelude::*;
 
@@ -896,7 +921,7 @@ impl<'a> EntryFields<'a> {
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
         #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
-        fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
+        fn set_xattrs<R: Read>(_: &mut EntryFields<R>, _: &Path) -> io::Result<()> {
             Ok(())
         }
     }
@@ -950,10 +975,14 @@ impl<'a> EntryFields<'a> {
     }
 }
 
-impl<'a> Read for EntryFields<'a> {
+impl<R: Read> Read for EntryFields<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
         loop {
-            match self.data.get_mut(0).map(|io| io.read(into)) {
+            match self
+                .data
+                .get_mut(0)
+                .map(|io| io.read(&mut self.reader, into))
+            {
                 Some(Ok(0)) => {
                     self.data.remove(0);
                 }
@@ -964,11 +993,16 @@ impl<'a> Read for EntryFields<'a> {
     }
 }
 
-impl<'a> Read for EntryIo<'a> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        match *self {
-            EntryIo::Pad(ref mut io) => io.read(into),
-            EntryIo::Data(ref mut io) => io.read(into),
+impl EntryIo {
+    fn read<R: Read>(&mut self, reader: &mut R, into: &mut [u8]) -> io::Result<usize> {
+        match self {
+            EntryIo::Pad(io) => io.read(into),
+            EntryIo::Data(remaining) => {
+                let mut bounded = reader.take(*remaining);
+                let n = bounded.read(into)?;
+                *remaining = bounded.limit();
+                Ok(n)
+            }
         }
     }
 }

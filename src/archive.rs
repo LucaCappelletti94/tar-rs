@@ -18,7 +18,7 @@ use crate::{Entry, GnuExtSparseHeader, GnuSparseHeader, Header};
 ///
 /// This archive can have an entry added to it and it can be iterated over.
 pub struct Archive<R: ?Sized + Read> {
-    inner: ArchiveInner<R>,
+    pub(crate) inner: ArchiveInner<R>,
 }
 
 pub struct ArchiveInner<R: ?Sized> {
@@ -175,6 +175,35 @@ impl<R: Read> Archive<R> {
     /// This can be used in case multiple tar archives have been concatenated together.
     pub fn set_ignore_zeros(&mut self, ignore_zeros: bool) {
         self.inner.ignore_zeros = ignore_zeros;
+    }
+
+    pub(crate) fn next_owned(
+        &self,
+        next: u64,
+        raw: bool,
+    ) -> io::Result<(Option<EntryFields<()>>, u64)> {
+        let mut entries = EntriesFields {
+            archive: self,
+            seekable_archive: None,
+            next,
+            done: false,
+            raw,
+        };
+        let entry = entries
+            .next_entry()?
+            .map(|entry| EntryFields::from(entry).map_reader(()));
+        Ok((entry, entries.next))
+    }
+
+    pub(crate) fn finish_owned(&self, next: u64) -> io::Result<()> {
+        let mut entries = EntriesFields {
+            archive: self,
+            seekable_archive: None,
+            next,
+            done: false,
+            raw: false,
+        };
+        EntriesFields::skip(&mut entries, next - self.inner.pos.get())
     }
 }
 
@@ -357,7 +386,8 @@ impl<'a> EntriesFields<'a> {
             size,
             header_pos,
             file_pos,
-            data: vec![EntryIo::Data((&self.archive.inner).take(size))],
+            data: vec![EntryIo::Data(size)],
+            reader: &self.archive.inner,
             header,
             long_pathname: None,
             long_linkname: None,
@@ -450,7 +480,10 @@ impl<'a> EntriesFields<'a> {
         }
     }
 
-    fn parse_sparse_header(&mut self, entry: &mut EntryFields<'a>) -> io::Result<()> {
+    fn parse_sparse_header(
+        &mut self,
+        entry: &mut EntryFields<&'a ArchiveInner<dyn Read + 'a>>,
+    ) -> io::Result<()> {
         if !entry.header.entry_type().is_gnu_sparse() {
             return Ok(());
         }
@@ -484,7 +517,6 @@ impl<'a> EntriesFields<'a> {
         let mut remaining = entry.size;
         {
             let data = &mut entry.data;
-            let reader = &self.archive.inner;
             let size = entry.size;
             let mut add_block = |block: &GnuSparseHeader| -> io::Result<_> {
                 if block.is_empty() {
@@ -515,7 +547,7 @@ impl<'a> EntriesFields<'a> {
                          listed",
                     )
                 })?;
-                data.push(EntryIo::Data(reader.take(len)));
+                data.push(EntryIo::Data(len));
                 Ok(())
             };
             for block in gnu.sparse.iter() {
@@ -600,6 +632,15 @@ impl<R: ?Sized + Read> Read for &ArchiveInner<R> {
         let i = self.obj.borrow_mut().read(into)?;
         self.pos.set(self.pos.get() + i as u64);
         Ok(i)
+    }
+}
+
+impl<R: Read> Read for ArchiveInner<R> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let n = self.obj.get_mut().read(into)?;
+        let amount = u64::try_from(n).map_err(|_| other("read size out of bounds"))?;
+        *self.pos.get_mut() += amount;
+        Ok(n)
     }
 }
 
